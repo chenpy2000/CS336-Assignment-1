@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import os
+import heapq
+import regex as re
+import multiprocessing
+from collections import Counter, defaultdict
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
 
@@ -561,6 +565,23 @@ def get_tokenizer(
     """
     raise NotImplementedError
 
+def _worker_bpe(args):
+    input_path, start, end, special_tokens, PAT = args
+    res = Counter()
+    with open(input_path, "rb") as f:
+        f.seek(start)
+        chunk = f.read(end - start).decode("utf-8")
+
+    segments = re.split('|'.join(re.escape(s) for s in special_tokens), chunk)
+
+    for segment in segments:
+        for match in re.finditer(PAT, segment):
+            elements = match.group().encode('utf-8')
+            token_tuple = tuple(bytes([b]) for b in elements)
+            res[token_tuple] += 1
+    
+    return res
+
 
 def run_train_bpe(
     input_path: str | os.PathLike,
@@ -570,7 +591,6 @@ def run_train_bpe(
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
     """Given the path to an input corpus, run train a BPE tokenizer and
     output its vocabulary and merges.
-
     Args:
         input_path (str | os.PathLike): Path to BPE tokenizer training data.
         vocab_size (int): Total number of items in the tokenizer's vocabulary (including special tokens).
@@ -589,4 +609,148 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    import time
+
+    with open(input_path, "rb") as f:
+        num_processes = 4
+        boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
+
+    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    data = Counter()
+    jobs = [
+        (input_path, start, end, special_tokens, PAT)
+        for start, end in zip(boundaries[:-1], boundaries[1:])
+    ]
+
+    with multiprocessing.Pool(processes=num_processes) as pool:
+        for result in pool.map(_worker_bpe, jobs):
+            data.update(result)
+
+    vocab_elems = []
+    for token_str in special_tokens:
+        vocab_elems.append(token_str.encode("utf-8"))
+    vocab_elems += [bytes([i]) for i in range(256)]
+
+    merges = []
+    pair_counts = defaultdict(int)
+    for token_tuple, count in data.items():
+        for i in range(len(token_tuple) - 1):
+            pair = (token_tuple[i], token_tuple[i+1])
+            pair_counts[pair] += count
+
+    while len(vocab_elems) < vocab_size:
+        #1, find the one with max number and break tie with lexicographical greater
+        best_pair, max_count = max(pair_counts.items(), key=lambda item: (item[1], item[0]))
+        merges.append(best_pair)
+
+        #2, append it at vocab_elements
+        new_token = best_pair[0] + best_pair[1]
+        vocab_elems.append(new_token)
+
+        #3, update the keys in data
+        new_data = Counter()
+        total_deltas = defaultdict(int)
+
+        for token_tuple, count in data.items():
+            # Create a new token tuple by merging the best_pair
+            # (b'h', b'e', b'l', b'l', b'o') -> (b'h', b'e', b'll', b'o')
+            new_token_tuple, deltas = merge_pair(
+                token_tuple, best_pair, new_token, count
+            )
+            new_data[new_token_tuple] += count
+            for p, d in deltas.items():
+                total_deltas[p] += d
+
+        #4, update pair_counts with deltas
+        for p, d in total_deltas.items():
+            pair_counts[p] = pair_counts.get(p, 0) + d
+            if pair_counts[p] <= 0:
+                pair_counts.pop(p, None)
+
+        # Replace old data with the newly merged data for the next loop
+        data = new_data
+
+    vocab = {i: token for i, token in enumerate(vocab_elems)}
+
+    return (vocab, merges)
+        
+def merge_pair(token_tuple, pair_to_merge, new_token, count):
+    """
+    Helper function to replace all occurrences of a pair in a token tuple
+    with a new, merged token.
+    
+    Example:
+    merge_pair((b'h', b'e', b'l', b'l', b'o'), (b'l', b'l'), b'll')
+    Returns: (b'h', b'e', b'll', b'o')
+    """
+
+    deltas = defaultdict(int)
+    out = []
+    i = 0
+    while i < len(token_tuple):
+        # Check if the pair (b'l', b'l') exists at the current position
+        if i < len(token_tuple) - 1 and (token_tuple[i], token_tuple[i+1]) == pair_to_merge:
+            left = out[-1] if out else None
+            right = token_tuple[i+2] if i + 2 < len(token_tuple) else None
+
+            deltas[(token_tuple[i], token_tuple[i+1])] -= count
+            if left is not None:
+                deltas[(left, token_tuple[i])] -= count
+                deltas[(left, new_token)] += count
+            if right is not None:
+                deltas[(token_tuple[i+1], right)] -= count
+                deltas[(new_token, right)] += count
+
+            out.append(new_token)
+            i += 2 # Skip both elements of the pair
+        else:
+            # No match, just append the current element
+            out.append(token_tuple[i])
+            i += 1
+    return tuple(out), deltas
+
+def find_chunk_boundaries(
+    file: BinaryIO,
+    desired_num_chunks: int,
+    split_special_token: bytes,
+) -> list[int]:
+    """
+    Chunk the file into parts that can be counted independently.
+    May return fewer chunks if the boundaries end up overlapping.
+    """
+    assert isinstance(split_special_token, bytes), "Must represent special token as a bytestring"
+
+    # Get total file size in bytes
+    file.seek(0, os.SEEK_END)
+    file_size = file.tell()
+    file.seek(0)
+
+    chunk_size = file_size // desired_num_chunks
+
+    # Initial guesses for chunk boundary locations, uniformly spaced
+    # Chunks start on previous index, don't include last index
+    chunk_boundaries = [i * chunk_size for i in range(desired_num_chunks + 1)]
+    chunk_boundaries[-1] = file_size
+
+    mini_chunk_size = 4096  # Read ahead by 4k bytes at a time
+
+    for bi in range(1, len(chunk_boundaries) - 1):
+        initial_position = chunk_boundaries[bi]
+        file.seek(initial_position)  # Start at boundary guess
+        while True:
+            mini_chunk = file.read(mini_chunk_size)  # Read a mini chunk
+
+            # If EOF, this boundary should be at the end of the file
+            if mini_chunk == b"":
+                chunk_boundaries[bi] = file_size
+                break
+
+            # Find the special token in the mini chunk
+            found_at = mini_chunk.find(split_special_token)
+            if found_at != -1:
+                chunk_boundaries[bi] = initial_position + found_at
+                break
+            initial_position += mini_chunk_size
+
+    # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
+    return sorted(set(chunk_boundaries))
